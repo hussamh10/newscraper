@@ -72,11 +72,17 @@
   <div class="card" style="margin-bottom:1rem;">
     <h2>Client quick start</h2>
     <div class="stats">
-      From any machine with Python and this repo cloned:
+      On a different laptop:
       <br/><br/>
+      <code>git clone https://github.com/hussamh10/newscraper.git</code>
+      <br/>
+      <code>cd newscraper</code>
+      <br/>
+      <code>python3 -m venv .venv && source .venv/bin/activate</code>
+      <br/>
       <code>pip install -r client/requirements.txt</code>
       <br/>
-      <code>python client/run_client.py --server http://obelix.cs.uiowa.edu:8000 --loop</code>
+      <code>python client/run_client.py --server http://obelix.cs.uiowa.edu:8765 --loop --client-id laptop-1</code>
       <br/><br/>
       Optional flags:
       <code>--source tribune</code>,
