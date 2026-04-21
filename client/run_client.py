@@ -15,6 +15,7 @@ import asyncio
 import importlib
 import json
 import logging
+import random
 import sys
 import time
 from pathlib import Path
@@ -154,6 +155,7 @@ async def run_one_batch(
     if not items:
         log.warning("empty claim payload")
         return False
+    random.shuffle(items)
 
     parser_instances: dict[str, Any] = {}
     dummy_out = REPO_ROOT / "client" / ".dummy_out.jsonl"
