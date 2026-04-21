@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>News scraper status</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --ok: #2fb986;
+      --warn: #e9a23b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.25rem;
+      line-height: 1.45;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 0.5rem; font-weight: 600; }
+    .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.25rem; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .card {
+      background: var(--panel);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      border: 1px solid #243044;
+    }
+    .card h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.95rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    .bar-wrap {
+      height: 10px;
+      background: #243044;
+      border-radius: 5px;
+      overflow: hidden;
+      margin: 0.5rem 0 0.75rem;
+    }
+    .bar { height: 100%; background: var(--accent); border-radius: 5px; transition: width 0.4s ease; }
+    .stats { font-size: 0.88rem; color: var(--muted); }
+    .stats strong { color: var(--text); }
+    canvas { width: 100%; max-width: 900px; height: 180px; display: block; margin-top: 0.5rem; }
+    .chart-card { max-width: 920px; }
+    .batch-list { font-size: 0.82rem; color: var(--muted); margin: 0; padding-left: 1.1rem; }
+    .batch-list li { margin: 0.25rem 0; }
+    .warn { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <h1>News scraper coordinator</h1>
+  <p class="meta" id="clock">Loading…</p>
+
+  <div class="card chart-card" style="margin-bottom:1rem;">
+    <h2>Done articles (last hour, 5‑minute buckets)</h2>
+    <canvas id="chart" width="900" height="180"></canvas>
+  </div>
+
+  <div class="card" style="margin-bottom:1rem;">
+    <h2>Client quick start</h2>
+    <div class="stats">
+      From any machine with Python and this repo cloned:
+      <br/><br/>
+      <code>pip install -r client/requirements.txt</code>
+      <br/>
+      <code>python client/run_client.py --server http://obelix.cs.uiowa.edu:8000 --loop</code>
+      <br/><br/>
+      Optional flags:
+      <code>--source tribune</code>,
+      <code>--batch-size 50</code>,
+      <code>--concurrency 20</code>,
+      <code>--client-id your-name</code>
+      <br/><br/>
+      Note: this endpoint is HTTP on port 8000 unless you put a TLS reverse proxy in front.
+    </div>
+  </div>
+
+  <div class="grid" id="sources"></div>
+
+  <div class="card" style="margin-top:1rem;">
+    <h2>Open batches</h2>
+    <p class="stats" id="open-batches"></p>
+    <ul class="batch-list" id="expiring"></ul>
+  </div>
+
+  <script>
+    const chartCanvas = document.getElementById("chart");
+    const ctx = chartCanvas.getContext("2d");
+
+    function drawChart(buckets) {
+      const w = chartCanvas.width;
+      const h = chartCanvas.height;
+      ctx.clearRect(0, 0, w, h);
+      const max = Math.max(1, ...buckets);
+      const n = buckets.length;
+      const pad = 36;
+      const bw = (w - pad * 2) / n - 4;
+      ctx.strokeStyle = "#243044";
+      ctx.beginPath();
+      ctx.moveTo(pad, h - 24);
+      ctx.lineTo(w - pad, h - 24);
+      ctx.stroke();
+      buckets.forEach((v, i) => {
+        const x = pad + i * ((w - pad * 2) / n) + 2;
+        const bh = (v / max) * (h - 48);
+        ctx.fillStyle = v > 0 ? "#3d8bfd" : "#243044";
+        ctx.fillRect(x, h - 24 - bh, Math.max(4, bw), bh);
+      });
+      ctx.fillStyle = "#8b9cb3";
+      ctx.font = "11px sans-serif";
+      ctx.fillText("0", 8, h - 20);
+      ctx.fillText(String(max), 8, 28);
+    }
+
+    function fmtNum(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+      return String(n);
+    }
+
+    async function tick() {
+      try {
+        const r = await fetch("/status");
+        const d = await r.json();
+        const t = new Date(d.server_time * 1000);
+        document.getElementById("clock").textContent =
+          "Server time: " + t.toLocaleString() +
+          " · Global done: " + fmtNum(d.global.done) + " / " + fmtNum(d.global.total) +
+          " (" + d.global.pct_done + "%) · ~" + d.global.rate_per_min_last_hour + " done/min (last hour avg)";
+
+        drawChart(d.chart_done_per_5min_last_hour || []);
+
+        const el = document.getElementById("sources");
+        el.innerHTML = "";
+        for (const [name, s] of Object.entries(d.sources || {})) {
+          const pct = s.pct_done || 0;
+          const card = document.createElement("div");
+          card.className = "card";
+          card.innerHTML =
+            "<h2>" + name + "</h2>" +
+            "<div class=\"bar-wrap\"><div class=\"bar\" style=\"width:" + pct + "%\"></div></div>" +
+            "<div class=\"stats\">" +
+            "<strong>" + fmtNum(s.done) + "</strong> done · " +
+            "<strong>" + fmtNum(s.pending) + "</strong> pending · " +
+            "<strong>" + fmtNum(s.leased) + "</strong> leased · " +
+            "<strong>" + fmtNum(s.failed) + "</strong> failed<br/>" +
+            "Rate ~" + (s.rate_per_min_last_hour || 0) + " done/min (last hour)" +
+            "</div>";
+          el.appendChild(card);
+        }
+
+        document.getElementById("open-batches").textContent =
+          "Open batches: " + (d.batches.open_count || 0);
+
+        const ul = document.getElementById("expiring");
+        ul.innerHTML = "";
+        (d.batches.expiring_soon || []).forEach((b) => {
+          const li = document.createElement("li");
+          li.className = b.remaining_sec < 120 ? "warn" : "";
+          li.textContent = b.batch_id.slice(0, 8) + "… · " + b.source + " · " + b.size + " urls · expires in " + b.remaining_sec + "s";
+          ul.appendChild(li);
+        });
+      } catch (e) {
+        document.getElementById("clock").textContent = "Error loading /status: " + e;
+      }
+    }
+
+    tick();
+    setInterval(tick, 5000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large URL source lists (keep local only)
+New_Downloader/*_urls.txt
+
+# Scraper/runtime generated outputs
+New_Downloader/scrapers/data/
+New_Downloader/scrapers/*.log
+New_Downloader/scrapers/*.jsonl
+New_Downloader/scrapers/test_report.txt
+New_Downloader/scrapers/test_scrapers.log
+
+# Server runtime state/output
+server/state.sqlite
+server/data/
+
+# Client local scratch
+client/.dummy_out.jsonl
+
+server/state.sqlite-shm
+server/state.sqlite-wal
+.DS_Store
