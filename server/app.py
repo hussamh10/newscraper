@@ -231,40 +231,74 @@ async def batch_claim(body: ClaimBody, request: Request) -> dict[str, Any]:
     assigned = body.client_id or client_ip or "unknown"
 
     async with db.transaction() as conn:
-        if source is None:
-            cur = await conn.execute(
-                "SELECT source FROM urls WHERE status='pending' "
-                "GROUP BY source ORDER BY COUNT(*) DESC LIMIT 1",
-            )
-            pick = await cur.fetchone()
-            if not pick:
-                raise HTTPException(status_code=404, detail="no pending URLs in any source")
-            source = pick["source"]
-        elif source not in SOURCES:
+        if source is not None and source not in SOURCES:
             raise HTTPException(status_code=400, detail=f"unknown source: {source}")
 
-        cur = await conn.execute(
-            "SELECT id, url FROM urls WHERE source=? AND status='pending' ORDER BY id LIMIT ?",
-            (source, size),
-        )
-        picked = await cur.fetchall()
-        if not picked:
+        picked_rows: list[dict[str, Any]] = []
+        batch_id = str(uuid.uuid4())
+        if source is None:
+            # Default mode: spread claims across multiple sources to reduce
+            # per-domain request bursts and lower ban risk.
+            cur = await conn.execute(
+                "SELECT source, COUNT(*) AS c FROM urls WHERE status='pending' "
+                "GROUP BY source ORDER BY c DESC",
+            )
+            active_sources = [r["source"] for r in await cur.fetchall()]
+            if not active_sources:
+                raise HTTPException(status_code=404, detail="no pending URLs in any source")
+
+            remaining = size
+            while remaining > 0 and active_sources:
+                next_sources: list[str] = []
+                for src in active_sources:
+                    if remaining == 0:
+                        break
+                    # Lease immediately while selecting to avoid picking the same row
+                    # multiple times before the final UPDATE.
+                    one = await conn.execute(
+                        "UPDATE urls SET status='leased', lease_token=?, lease_expires=?, assigned_to=? "
+                        "WHERE id = ("
+                        "  SELECT id FROM urls WHERE source=? AND status='pending' ORDER BY id LIMIT 1"
+                        ") AND status='pending' "
+                        "RETURNING id, url, source",
+                        (batch_id, expires_at, assigned, src),
+                    )
+                    row = await one.fetchone()
+                    if row:
+                        picked_rows.append(
+                            {"id": int(row["id"]), "url": row["url"], "source": row["source"]}
+                        )
+                        remaining -= 1
+                        next_sources.append(src)
+                active_sources = next_sources
+        else:
+            cur = await conn.execute(
+                "SELECT id, url, source FROM urls WHERE source=? AND status='pending' ORDER BY id LIMIT ?",
+                (source, size),
+            )
+            for r in await cur.fetchall():
+                picked_rows.append({"id": int(r["id"]), "url": r["url"], "source": r["source"]})
+
+        if not picked_rows:
+            if source is None:
+                raise HTTPException(status_code=404, detail="no pending URLs available")
             raise HTTPException(status_code=404, detail=f"no pending URLs for source {source}")
 
-        ids = [int(r["id"]) for r in picked]
-        urls = [r["url"] for r in picked]
-        batch_id = str(uuid.uuid4())
-        qmarks = ",".join("?" * len(ids))
-        await conn.execute(
-            f"UPDATE urls SET status='leased', lease_token=?, lease_expires=?, assigned_to=? "
-            f"WHERE id IN ({qmarks}) AND status='pending'",
-            (batch_id, expires_at, assigned, *ids),
-        )
+        ids = [r["id"] for r in picked_rows]
+        urls = [r["url"] for r in picked_rows]
+        if source is not None:
+            qmarks = ",".join("?" * len(ids))
+            await conn.execute(
+                f"UPDATE urls SET status='leased', lease_token=?, lease_expires=?, assigned_to=? "
+                f"WHERE id IN ({qmarks}) AND status='pending'",
+                (batch_id, expires_at, assigned, *ids),
+            )
 
+        batch_source = source if source is not None else "mixed"
         await conn.execute(
             "INSERT INTO batches(batch_id, source, size, created_at, expires_at, client_ip, state) "
             "VALUES (?,?,?,?,?,?, 'open')",
-            (batch_id, source, len(ids), now, expires_at, client_ip),
+            (batch_id, batch_source, len(ids), now, expires_at, client_ip),
         )
         await conn.executemany(
             "INSERT INTO batch_items(batch_id, url_id, url) VALUES (?,?,?)",
@@ -273,8 +307,9 @@ async def batch_claim(body: ClaimBody, request: Request) -> dict[str, Any]:
 
     return {
         "batch_id": batch_id,
-        "source": source,
+        "source": batch_source,
         "urls": urls,
+        "items": [{"url": r["url"], "source": r["source"]} for r in picked_rows],
         "expires_at": expires_at,
         "size": len(urls),
     }
@@ -324,18 +359,19 @@ async def batch_submit(batch_id: str, body: SubmitBody) -> dict[str, Any]:
         if int(b["expires_at"]) < now:
             raise HTTPException(status_code=400, detail="batch lease expired")
 
-        source = b["source"]
+        batch_source = b["source"]
         cur = await conn.execute(
-            "SELECT url_id, url FROM batch_items WHERE batch_id=?",
+            "SELECT bi.url_id, bi.url, u.source FROM batch_items bi "
+            "JOIN urls u ON u.id = bi.url_id WHERE bi.batch_id=?",
             (batch_id,),
         )
         items = await cur.fetchall()
-        allowed = {r["url"]: int(r["url_id"]) for r in items}
+        allowed = {r["url"]: (int(r["url_id"]), r["source"]) for r in items}
         seen_urls: set[str] = set()
 
         done_n = 0
         failed_n = 0
-        ok_records: list[dict[str, Any]] = []
+        ok_records: list[tuple[str, dict[str, Any]]] = []
 
         for res in body.results:
             if res.url in seen_urls:
@@ -344,17 +380,20 @@ async def batch_submit(batch_id: str, body: SubmitBody) -> dict[str, Any]:
             if res.url not in allowed:
                 raise HTTPException(status_code=400, detail=f"url not in batch: {res.url}")
 
-            url_id = allowed[res.url]
+            url_id, expected_source = allowed[res.url]
             if res.ok:
                 if not res.record:
                     raise HTTPException(status_code=400, detail=f"missing record for ok url {res.url}")
                 rec = res.record
                 if rec.get("url") != res.url:
                     raise HTTPException(status_code=400, detail="record.url mismatch")
-                if rec.get("source") != source:
-                    raise HTTPException(status_code=400, detail="record.source mismatch")
+                if rec.get("source") != expected_source:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"record.source mismatch for url {res.url}",
+                    )
 
-                ok_records.append(rec)
+                ok_records.append((expected_source, rec))
                 await conn.execute(
                     "UPDATE urls SET status='done', done_at=?, error=NULL, lease_token=NULL, "
                     "lease_expires=NULL WHERE id=?",
@@ -376,9 +415,9 @@ async def batch_submit(batch_id: str, body: SubmitBody) -> dict[str, Any]:
         )
 
     written = 0
-    store = storage.get_store(source)
-    for rec in ok_records:
+    for expected_source, rec in ok_records:
         try:
+            store = storage.get_store(expected_source)
             if await store.append(rec):
                 written += 1
         except Exception:

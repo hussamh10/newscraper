@@ -147,25 +147,34 @@ async def run_one_batch(
         return False
 
     batch_id = claim["batch_id"]
-    src = claim["source"]
-    urls: list[str] = claim["urls"]
-    parser_spec = parser_map.get(src)
-    if not parser_spec:
-        raise RuntimeError(f"unknown source from server: {src}")
+    batch_source = claim["source"]
+    items: list[dict[str, str]] = claim.get("items") or [
+        {"url": u, "source": batch_source} for u in claim["urls"]
+    ]
+    if not items:
+        log.warning("empty claim payload")
+        return False
 
-    ParserCls = load_parser_class(parser_spec)
+    parser_instances: dict[str, Any] = {}
     dummy_out = REPO_ROOT / "client" / ".dummy_out.jsonl"
     dummy_out.parent.mkdir(parents=True, exist_ok=True)
-    scraper = ParserCls(output_file=str(dummy_out), max_concurrent=concurrency)
+    for item in items:
+        src = item["source"]
+        if src in parser_instances:
+            continue
+        parser_spec = parser_map.get(src)
+        if not parser_spec:
+            raise RuntimeError(f"unknown source from server: {src}")
+        ParserCls = load_parser_class(parser_spec)
+        parser_instances[src] = ParserCls(output_file=str(dummy_out), max_concurrent=concurrency)
 
-    timeout = aiohttp.ClientTimeout(total=scraper.TIMEOUT + 5)
+    timeout = aiohttp.ClientTimeout(total=35)
     connector = aiohttp.TCPConnector(limit=concurrency + 10, ttl_dns_cache=300)
     headers = {
-        "User-Agent": scraper.USER_AGENT,
+        "User-Agent": "news-scraper-client/1.0",
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.7,ur;q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
-        **scraper.EXTRA_HEADERS,
     }
 
     sem = asyncio.Semaphore(concurrency)
@@ -177,22 +186,25 @@ async def run_one_batch(
             timeout=timeout,
             headers=headers,
         ) as fetch_session:
-            scraper._session = fetch_session
-            tasks = [asyncio.create_task(scrape_one_url(scraper, u, sem, src)) for u in urls]
-            results: list[dict[str, Any]] = []
-            for t in asyncio.as_completed(tasks):
-                results.append(await t)
+            for scraper in parser_instances.values():
+                scraper._session = fetch_session
+            tasks = [
+                asyncio.create_task(
+                    scrape_one_url(parser_instances[item["source"]], item["url"], sem, item["source"])
+                )
+                for item in items
+            ]
+            results = await asyncio.gather(*tasks)
     finally:
         hb.cancel()
         try:
             await hb
         except asyncio.CancelledError:
             pass
-        scraper._session = None
+        for scraper in parser_instances.values():
+            scraper._session = None
 
-    by_url = {r["url"]: r for r in results}
-    ordered = [by_url[u] for u in urls]
-    summary = await submit_batch(session, base, batch_id, ordered)
+    summary = await submit_batch(session, base, batch_id, results)
     log.info(
         "submitted batch %s: ok=%s fail=%s lines=%s",
         batch_id[:8],
